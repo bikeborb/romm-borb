@@ -30,6 +30,8 @@ from fastapi_pagination import resolve_params
 from fastapi_pagination.limit_offset import LimitOffsetPage, LimitOffsetParams
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import defer
+from sqlalchemy.orm.attributes import set_committed_value
 from starlette.responses import FileResponse
 
 from config import (
@@ -157,8 +159,54 @@ LEAN_BLANKED_FIELDS: dict[str, Any] = {
 }
 
 
+# The subset of the above that are real columns on `roms`, so they can be left
+# out of the SELECT entirely rather than read, JSON-decoded into Python and then
+# thrown away. Measured at roughly 22ms of per-row cost on a 36k library, which
+# dominates a list request - see server-patch/ROMM-BUGS.md entry 2.
+LEAN_DEFERRED_COLUMNS = (
+    "igdb_metadata",
+    "moby_metadata",
+    "ss_metadata",
+    "launchbox_metadata",
+    "hasheous_metadata",
+    "flashpoint_metadata",
+    "hltb_metadata",
+    "gamelist_metadata",
+    "manual_metadata",
+    "summary",
+)
+
+
+def lean_query_options() -> list[Any]:
+    """Loader options that keep the heavy columns out of a lean SELECT."""
+    return [defer(getattr(Rom, name)) for name in LEAN_DEFERRED_COLUMNS]
+
+
+def blank_deferred_columns(rom: Rom) -> None:
+    """Give the deferred columns a value without going back to the database.
+
+    Two traps here, both load-bearing.
+
+    Reading a deferred attribute triggers a lazy load, so serialising a page of
+    50 rows would emit 50 extra SELECTs - the deferral would cost more than it
+    saved. The schema reads every field, so the values have to be present
+    before it runs.
+
+    And plain assignment records attribute history, which marks the object
+    dirty. The list endpoint runs inside `with sync_session.begin()`, which
+    commits on exit, so a dirty object would flush - writing NULL over real
+    provider metadata. That is data loss, not a slow page.
+
+    set_committed_value() does neither: it installs the value as though it had
+    been loaded that way, emitting no SQL and leaving the object clean.
+    """
+    for name in LEAN_DEFERRED_COLUMNS:
+        set_committed_value(rom, name, None)
+
+
 def apply_lean(rom: SimpleRomSchema) -> SimpleRomSchema:
-    """Blank the fields a list view never reads. See LEAN_BLANKED_FIELDS."""
+    """Blank the remaining fields, which are relationships and derived values
+    rather than columns and so cannot be deferred. See LEAN_BLANKED_FIELDS."""
     for field, empty in LEAN_BLANKED_FIELDS.items():
         if hasattr(rom, field):
             try:
@@ -898,6 +946,11 @@ def get_roms(
                         item, latest_saves.get(item.id)
                     )
 
+            # Before the schema touches them: see blank_deferred_columns().
+            if lean:
+                for item in items:
+                    blank_deferred_columns(item)
+
             rows = [
                 SimpleRomSchema.from_orm_with_request(
                     db_rom=item,
@@ -915,7 +968,10 @@ def get_roms(
             total = len(rom_id_index)
             page_ids = list(rom_id_index[params.offset : params.offset + params.limit])
             if page_ids:
-                page_rows = session.scalars(query.where(Rom.id.in_(page_ids))).all()
+                page_q = query.where(Rom.id.in_(page_ids))
+                if lean:
+                    page_q = page_q.options(*lean_query_options())
+                page_rows = session.scalars(page_q).all()
                 rows_by_id = {rom.id: rom for rom in page_rows}
                 page_items = [rows_by_id[i] for i in page_ids if i in rows_by_id]
             else:
@@ -923,9 +979,10 @@ def get_roms(
         else:
             # Let the database serve the page from the sort index instead of
             # walking the whole primary key to build a full id list.
-            page_items = list(
-                session.scalars(query.offset(params.offset).limit(params.limit)).all()
-            )
+            page_q = query.offset(params.offset).limit(params.limit)
+            if lean:
+                page_q = page_q.options(*lean_query_options())
+            page_items = list(session.scalars(page_q).all())
             total = db_rom_handler.get_rom_count(query=query, session=session)
 
         return CustomLimitOffsetPage.create(
