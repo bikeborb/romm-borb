@@ -236,6 +236,39 @@ def _cache_value_to_str(value: Any) -> str | None:
     return str(value)
 
 
+def _is_already_joined(query: Select, model: Any) -> bool:
+    """True when `model`'s table is already in the query's FROM clause.
+
+    `RomMetadata` is outer-joined from two independent places - once when a
+    filter needs it, once when `order_by` resolves to a metadata column.
+    Neither call site could see the other, so asking for a metadata sort and a
+    metadata filter in the same request emitted two `LEFT OUTER JOIN
+    roms_metadata` clauses and Postgres rejected the statement with
+    DuplicateAlias.
+
+    Compares table names rather than object identity: the FROM clause holds
+    `AnnotatedTable` wrappers, not the `Table` objects hanging off the model.
+    An alias carries the alias name and so correctly does not match.
+    """
+    target = model.__table__.name
+
+    def walk(element: Any) -> bool:
+        if getattr(element, "name", None) == target:
+            return True
+        left = getattr(element, "left", None)
+        right = getattr(element, "right", None)
+        return (left is not None and walk(left)) or (right is not None and walk(right))
+
+    return any(walk(from_obj) for from_obj in query.get_final_froms())
+
+
+def _outerjoin_metadata_once(query: Select) -> Select:
+    """Outer-join `RomMetadata` unless an earlier call site already did."""
+    if _is_already_joined(query, RomMetadata):
+        return query
+    return query.outerjoin(RomMetadata, RomMetadata.rom_id == Rom.id)
+
+
 def _filter_values_cache_version() -> str:
     return _cache_value_to_str(sync_cache.get(ROM_FILTERS_CACHE_VERSION_KEY)) or "0"
 
@@ -1212,7 +1245,7 @@ class DBRomsHandler(DBBaseHandler):
         )
 
         if needs_metadata_join:
-            query = query.outerjoin(RomMetadata)
+            query = _outerjoin_metadata_once(query)
 
         # Apply metadata and rom-level filters efficiently
         filters_to_apply = [
@@ -1288,7 +1321,7 @@ class DBRomsHandler(DBBaseHandler):
             query = query.filter(RomUser.user_id == user_id)
         elif hasattr(RomMetadata, order_by) and not hasattr(Rom, order_by):
             order_attr = getattr(RomMetadata, order_by)
-            query = query.outerjoin(RomMetadata, RomMetadata.rom_id == Rom.id)
+            query = _outerjoin_metadata_once(query)
         elif hasattr(Rom, order_by):
             order_attr = getattr(Rom, order_by)
         else:
