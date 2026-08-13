@@ -382,6 +382,19 @@ class CustomLimitOffsetPage[T: BaseModel](LimitOffsetPage[T]):
 @protected_route(router.get, "", [Scope.ROMS_READ])
 def get_roms(
     request: Request,
+    switch_base_only: Annotated[
+        bool,
+        Query(
+            description=(
+                "Nintendo Switch only. Return base games, dropping updates and"
+                " DLC, classified from the 16 hex digit title ID the scanner"
+                " leaves in the filename: `000` is a base game, `800` an"
+                " update, anything else DLC. Entries with no recognisable"
+                " title ID are kept, since an unidentified file is not"
+                " evidence that it is an add-on."
+            )
+        ),
+    ] = False,
     lean: Annotated[
         bool,
         Query(
@@ -735,6 +748,7 @@ def get_roms(
         metadata_providers_logic=metadata_providers_logic,
         tags_logic=tags_logic,
         group_by_meta_id=group_by_meta_id,
+        switch_base_only=switch_base_only,
         updated_after=updated_after,
         include_file_stats=True,
     )
@@ -766,6 +780,7 @@ def get_roms(
         ),
         "tags": sorted(tags) if tags else None,
         "updated_after": updated_after,
+        "switch_base_only": switch_base_only or None,
         "matched": matched,
         "favorite": favorite,
         "duplicate": duplicate,

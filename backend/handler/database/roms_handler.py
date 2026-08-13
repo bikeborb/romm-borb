@@ -42,6 +42,7 @@ from sqlalchemy.sql.selectable import Select
 from config import ROMM_DB_DRIVER
 from decorators.database import begin_session
 from handler.metadata.base_handler import UniversalPlatformSlug as UPS
+from logger.logger import log
 from handler.redis_handler import sync_cache
 from models.assets import Save, Screenshot, State
 from models.base import compute_file_name_parts
@@ -64,6 +65,9 @@ from utils import get_version
 from utils.database import (
     LIKE_ESCAPE_CHAR,
     escape_like,
+    is_mariadb,
+    is_mysql,
+    is_postgresql,
     json_array_contains_all,
     json_array_contains_any,
     json_array_contains_value,
@@ -913,6 +917,50 @@ class DBRomsHandler(DBBaseHandler):
         condition = op(Rom.languages, values, session=session)
         return query.filter(~condition) if match_none else query.filter(condition)
 
+    def _filter_by_switch_base(self, query: Query, *, session: Session) -> Query:
+        """Keep Switch base games; drop updates and DLC.
+
+        Switch content is identified by a 16 hex digit title ID that RomM's
+        scanner leaves in the filename as a bracketed tag. The last three
+        digits are the content type: `000` is the base game, `800` an update,
+        anything else DLC.
+
+        Classified from `fs_name` rather than from `tags`, deliberately. The
+        Switch client derives the same ID from the same field, so filtering on
+        anything else risks the two disagreeing about what a row is - and a
+        base game the server calls an add-on is a game the user cannot install.
+
+        An entry with no recognisable title ID is KEPT, matching the client:
+        a missing ID means the scan did not identify the file, not that it is
+        an add-on, and hiding those would make a real game unreachable.
+
+        No index helps here - the pattern is unanchored - so this is a scan of
+        the platform's rows. That is still far cheaper than the alternative,
+        which is the client over-fetching ten rows for every one it can show
+        and discarding the rest.
+        """
+        conn = session.get_bind()
+        has_title_id = r"\[[0-9A-Fa-f]{16}\]"
+        is_base_game = r"\[[0-9A-Fa-f]{13}000\]"
+
+        if is_postgresql(conn):
+            op = "~"
+        elif is_mysql(conn) or is_mariadb(conn):
+            op = "REGEXP"
+        else:
+            # SQLite and anything else: no portable regex. Returning the query
+            # untouched means the client falls back to filtering locally, which
+            # is what it did before this existed - slower, never wrong.
+            log.warning("switch_base_only ignored: no regex support on this database")
+            return query
+
+        return query.filter(
+            or_(
+                Rom.fs_name.op(op)(is_base_game),
+                not_(Rom.fs_name.op(op)(has_title_id)),
+            )
+        )
+
     def _filter_by_tags(
         self,
         query: Query,
@@ -994,6 +1042,7 @@ class DBRomsHandler(DBBaseHandler):
         verified: bool | None = None,
         has_soundtrack: bool | None = None,
         group_by_meta_id: bool = False,
+        switch_base_only: bool = False,
         genres: Sequence[str] | None = None,
         franchises: Sequence[str] | None = None,
         collections: Sequence[str] | None = None,
@@ -1081,6 +1130,9 @@ class DBRomsHandler(DBBaseHandler):
 
         if search_term:
             query = self._filter_by_search_term(query, search_term)
+
+        if switch_base_only:
+            query = self._filter_by_switch_base(query, session=session)
 
         if matched is not None:
             query = self._filter_by_matched(query, value=matched)
