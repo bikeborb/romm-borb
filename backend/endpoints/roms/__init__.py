@@ -2,9 +2,10 @@ import binascii
 import json
 from base64 import b64encode
 from datetime import datetime, timezone
+from hashlib import sha1
 from io import BytesIO
 from stat import S_IFREG
-from typing import Annotated, Any, Sequence
+from typing import Annotated, Any, Mapping, Sequence
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
@@ -121,23 +122,44 @@ def safe_int_or_none(value: Any) -> int | None:
     return safe_int(value)
 
 
-def build_unscoped_sidecar_cache_key(
+def build_sidecar_cache_key(
     user_id: int,
     order_by: str,
     order_dir: str,
     group_by_meta_id: bool,
-    is_unscoped: bool,
-) -> str | None:
-    """Cache key for the unscoped library sidecars (char index, filter values,
-    rom id index). Returns None for scoped/searched sets, which are computed live.
-    The computed values depend on user, ordering and grouping, so all are part
-    of the key.
+    scope: Mapping[str, Any] | None = None,
+) -> str:
+    """Cache key for the library sidecars (char index, filter values, rom id
+    index). The computed values depend on user, ordering and grouping, so all
+    are part of the key.
+
+    `scope` carries every parameter that narrows the query. Passing None (or an
+    empty mapping) is the whole-library scan and keys as "all".
+
+    These used to be cached only for the unscoped scan, and any narrowing
+    parameter returned None so all three sidecars were recomputed on every
+    request. That is what made `?matched=true` with a metadata sort take longer
+    than a 180 s client timeout: not the rows, which are one indexed page, but
+    `filter_values` re-deriving every facet over the whole library and
+    `rom_id_index` re-listing 36k ids, each time, uncached.
+
+    Narrowing parameters are hashed rather than spelled out so the key stays
+    bounded, and the digest covers the `*_logic` operators too. They were left
+    out before on the grounds that they only matter when their list filter is
+    set - true, but that argument only held while any list filter disabled
+    caching outright. Now that a filtered set is cacheable, `genres=a&genres=b`
+    under "any" and under "all" are different result sets and must not share a
+    key.
     """
-    if not is_unscoped:
-        return None
+    scope_token = "all"
+    if scope:
+        active = {k: v for k, v in scope.items() if v is not None and v != []}
+        if active:
+            canonical = json.dumps(active, sort_keys=True, default=str)
+            scope_token = "q" + sha1(canonical.encode()).hexdigest()[:16]
 
     return (
-        f"all:u{user_id}"
+        f"{scope_token}:u{user_id}"
         f":o{order_by.lower()}:d{order_dir.lower()}:g{int(group_by_meta_id)}"
     )
 
@@ -657,42 +679,62 @@ def get_roms(
         include_file_stats=True,
     )
 
-    # Cache only the fully unscoped library scan; any narrowing parameter makes
-    # the result set narrower, so it is computed live. The sidecar cache key
-    # encodes only user/order/grouping, not the filters, so every filter applied
-    # to `query` below must gate caching here or a narrowed list leaks under the
-    # shared "all" key. Bool flags use `is not None` since False is an active
-    # filter. Logic operators are omitted: they only matter when their list
-    # filter is set, which is already covered.
-    is_unscoped = not (
-        search_term
-        or platform_ids
-        or collection_id
-        or virtual_collection_id
-        or smart_collection_id
-        or genres
-        or franchises
-        or collections
-        or companies
-        or age_ratings
-        or statuses
-        or regions
-        or languages
-        or player_counts
-        or metadata_providers
-        or tags
-        or updated_after
-        or matched is not None
-        or favorite is not None
-        or duplicate is not None
-        or last_played is not None
-        or playable is not None
-        or has_ra is not None
-        or has_saves is not None
-        or has_states is not None
-        or missing is not None
-        or verified is not None
-        or has_soundtrack is not None
+    # Everything that narrows `query`, hashed into the sidecar cache key.
+    #
+    # Every filter passed to filter_roms() above must appear here, or a narrowed
+    # list leaks under another scope's key - which is the failure mode this
+    # guards against, so keep the two lists in step. Bool flags are kept as-is
+    # rather than coerced, since False is an active filter and None is "not
+    # asked for"; build_sidecar_cache_key() drops only the Nones.
+    sidecar_scope: dict[str, Any] = {
+        "search_term": search_term,
+        "platform_ids": sorted(platform_ids) if platform_ids else None,
+        "collection_id": collection_id,
+        "virtual_collection_id": virtual_collection_id,
+        "smart_collection_id": smart_collection_id,
+        "genres": sorted(genres) if genres else None,
+        "franchises": sorted(franchises) if franchises else None,
+        "collections": sorted(collections) if collections else None,
+        "companies": sorted(companies) if companies else None,
+        "age_ratings": sorted(age_ratings) if age_ratings else None,
+        "statuses": sorted(statuses) if statuses else None,
+        "regions": sorted(regions) if regions else None,
+        "languages": sorted(languages) if languages else None,
+        "player_counts": sorted(player_counts) if player_counts else None,
+        "metadata_providers": (
+            sorted(metadata_providers) if metadata_providers else None
+        ),
+        "tags": sorted(tags) if tags else None,
+        "updated_after": updated_after,
+        "matched": matched,
+        "favorite": favorite,
+        "duplicate": duplicate,
+        "last_played": last_played,
+        "playable": playable,
+        "has_ra": has_ra,
+        "has_saves": has_saves,
+        "has_states": has_states,
+        "missing": missing,
+        "verified": verified,
+        "has_soundtrack": has_soundtrack,
+        # Only meaningful alongside their list filter, but cheap to include and
+        # wrong to omit now that filtered sets are cached.
+        "genres_logic": genres_logic if genres else None,
+        "franchises_logic": franchises_logic if franchises else None,
+        "collections_logic": collections_logic if collections else None,
+        "companies_logic": companies_logic if companies else None,
+        "age_ratings_logic": age_ratings_logic if age_ratings else None,
+        "regions_logic": regions_logic if regions else None,
+        "languages_logic": languages_logic if languages else None,
+        "statuses_logic": statuses_logic if statuses else None,
+        "player_counts_logic": player_counts_logic if player_counts else None,
+        "metadata_providers_logic": (
+            metadata_providers_logic if metadata_providers else None
+        ),
+        "tags_logic": tags_logic if tags else None,
+    }
+    sidecar_cache_key = build_sidecar_cache_key(
+        request.user.id, order_by, order_dir, group_by_meta_id, sidecar_scope
     )
 
     # Get the char index for the roms
@@ -700,14 +742,11 @@ def get_roms(
     if with_char_index:
         # Switching sort direction/column (or toggling grouping) must not reuse
         # a stale index, or the AlphaStrip highlights the wrong letters.
-        char_index_cache_key = build_unscoped_sidecar_cache_key(
-            request.user.id, order_by, order_dir, group_by_meta_id, is_unscoped
-        )
         char_index = db_rom_handler.with_char_index(
             query=query,
             order_by_attr=order_by_attr,
             order_dir=order_dir.lower(),
-            cache_key=char_index_cache_key,
+            cache_key=sidecar_cache_key,
         )
         char_index_dict = {char: index for (char, index) in char_index}
 
@@ -737,12 +776,9 @@ def get_roms(
             smart_collection_id=smart_collection_id,
             search_term=search_term,
         )
-        cache_key = build_unscoped_sidecar_cache_key(
-            request.user.id, order_by, order_dir, group_by_meta_id, is_unscoped
-        )
         query_filters = db_rom_handler.with_filter_values(
             query=filter_query,
-            cache_key=cache_key,
+            cache_key=sidecar_cache_key,
         )
         # trunk-ignore(mypy/typeddict-item)
         filter_values = RomFiltersDict(**query_filters)
@@ -754,11 +790,8 @@ def get_roms(
     if with_rom_id_index:
         # Memoise the unscoped library scan (same key scheme as the other
         # sidecars); scoped/searched sets stay live.
-        rom_id_index_cache_key = build_unscoped_sidecar_cache_key(
-            request.user.id, order_by, order_dir, group_by_meta_id, is_unscoped
-        )
         rom_id_index = db_rom_handler.get_rom_id_index(
-            query=query, cache_key=rom_id_index_cache_key
+            query=query, cache_key=sidecar_cache_key
         )
 
     # Hydrate the requested page and its additional data
