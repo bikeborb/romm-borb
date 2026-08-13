@@ -1340,6 +1340,29 @@ class DBRomsHandler(DBBaseHandler):
         else:
             order_attr = order_attr.asc()
 
+        # Sort NULLs last, for the columns that can actually be NULL.
+        #
+        # `first_release_date` and `average_rating` live on RomMetadata, and the
+        # RomUser columns on rom_user; both reach Rom through an outer join, so
+        # every ROM the providers never matched (or that this user has no row
+        # for) is NULL there. Postgres defaults to NULLS FIRST on DESC, so
+        # "newest first" opened on a wall of undated entries before a single
+        # real release date.
+        #
+        # Deliberately limited to the outer-joined columns. Rom's own sort
+        # columns are indexed - `name_sort_key` and `fs_size_bytes` among them -
+        # and DESC NULLS LAST is not what a backwards index scan produces, so
+        # applying this to them would trade a cosmetic fix for a filesort on
+        # every page of a 36k-row library.
+        null_rank_clause = None
+        if getattr(order_attr_column, "table", None) is not Rom.__table__:
+            if ROMM_DB_DRIVER in ("mariadb", "mysql"):
+                # Neither supports NULLS LAST. `col IS NULL` ascending sorts 0
+                # (present) before 1 (missing), which is the same thing.
+                null_rank_clause = order_attr_column.is_(None).asc()
+            else:
+                order_attr = order_attr.nulls_last()
+
         relevance_clause = None
         if search_term and ROMM_DB_DRIVER in ("mariadb", "mysql"):
             relevance = self._build_fulltext_relevance(search_term)
@@ -1349,12 +1372,18 @@ class DBRomsHandler(DBBaseHandler):
                     "AGAINST(:relevance IN BOOLEAN MODE) DESC"
                 ).bindparams(relevance=relevance)
 
+        # The null rank has to lead its own column to group the NULLs, but must
+        # not displace relevance when relevance is what leads.
+        sort_terms = (
+            [order_attr] if null_rank_clause is None else [null_rank_clause, order_attr]
+        )
+
         if order_by:  # explicit sort wins, relevance breaks ties
-            order_clauses = [order_attr]
+            order_clauses = list(sort_terms)
             if relevance_clause is not None:
                 order_clauses.append(relevance_clause)
         else:  # no sort selected: relevance leads, name is the tiebreaker
-            order_clauses = [order_attr]
+            order_clauses = list(sort_terms)
             if relevance_clause is not None:
                 order_clauses.insert(0, relevance_clause)
 
