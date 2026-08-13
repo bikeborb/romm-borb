@@ -362,8 +362,12 @@ else
 fi
 
 # Run needed database migrations once at startup
+#
+# "heads", not "head": the download-statistics migration is an independent
+# alembic branch, so this tree has two heads on purpose and the singular form
+# would abort. See backend/alembic/versions/0108_download_statistics.py.
 info_log "Running database migrations"
-if alembic upgrade head; then
+if alembic upgrade heads; then
 	info_log "Database migrations succeeded"
 else
 	error_log "Failed to run database migrations"

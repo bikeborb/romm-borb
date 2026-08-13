@@ -18,6 +18,7 @@ import CreateUserDialog from "@/v2/components/Settings/CreateUserDialog.vue";
 import EditUserDialog from "@/v2/components/Settings/EditUserDialog.vue";
 import GroupFormDialog from "@/v2/components/Settings/GroupFormDialog.vue";
 import InviteLinkDialog from "@/v2/components/Settings/InviteLinkDialog.vue";
+import DownloadStatsSection from "@/v2/components/Settings/DownloadStatsSection.vue";
 import PermissionGroupsSection from "@/v2/components/Settings/PermissionGroupsSection.vue";
 import TasksSection from "@/v2/components/Settings/TasksSection.vue";
 import UsersSection from "@/v2/components/Settings/UsersSection.vue";
@@ -27,8 +28,8 @@ const route = useRoute();
 const router = useRouter();
 const auth = storeAuth();
 
-type Tab = "users" | "groups" | "tokens" | "tasks";
-const validTabs: Tab[] = ["users", "groups", "tokens", "tasks"];
+type Tab = "users" | "groups" | "tokens" | "downloads" | "tasks";
+const validTabs: Tab[] = ["users", "groups", "tokens", "downloads", "tasks"];
 
 const tab = ref<Tab>(
   (validTabs as string[]).includes(route.query.tab as string)
@@ -79,6 +80,13 @@ const tabs = computed<RTabNavItem[]>(() => {
       icon: "mdi-key-variant",
     });
   }
+  if (auth.scopes.includes("users.read")) {
+    items.push({
+      id: "downloads",
+      label: t("settings.downloads"),
+      icon: "mdi-download",
+    });
+  }
   if (auth.scopes.includes("tasks.run")) {
     items.push({
       id: "tasks",
@@ -105,6 +113,7 @@ const tabModel = computed<string>({
     <UsersSection v-if="tab === 'users'" />
     <PermissionGroupsSection v-else-if="tab === 'groups'" />
     <AdminTokensSection v-else-if="tab === 'tokens'" />
+    <DownloadStatsSection v-else-if="tab === 'downloads'" />
     <TasksSection v-else-if="tab === 'tasks'" />
 
     <CreateUserDialog />

@@ -37,6 +37,7 @@ from endpoints.collections import router as collections_router
 from endpoints.configs import router as configs_router
 from endpoints.device import router as device_router
 from endpoints.device_auth import router as device_auth_router
+from endpoints.downloads import router as downloads_router
 from endpoints.export import router as export_router
 from endpoints.feeds import router as feeds_router
 from endpoints.firmware import router as firmware_router
@@ -187,6 +188,7 @@ app.include_router(tasks_router, prefix="/api")
 app.include_router(feeds_router, prefix="/api")
 app.include_router(configs_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
+app.include_router(downloads_router, prefix="/api")
 app.include_router(logs_router, prefix="/api")
 app.include_router(screenshots_router, prefix="/api")
 app.include_router(firmware_router, prefix="/api")
@@ -205,8 +207,14 @@ add_pagination(app)
 # NOTE: This code is only executed when running the application directly,
 # not by deployments using gunicorn.
 if __name__ == "__main__":
-    # Run migrations
-    alembic.config.main(argv=["upgrade", "head"])
+    # Run migrations.
+    #
+    # "heads", not "head". The download-statistics migration is an independent
+    # alembic branch (see 0108_download_statistics), so this tree legitimately
+    # has two heads and the singular form would abort with "Multiple head
+    # revisions are present". The branch exists so RomM upgrades never have to
+    # reconcile our migration against upstream's chain.
+    alembic.config.main(argv=["upgrade", "heads"])
 
     # Run startup tasks
     asyncio.run(main())
