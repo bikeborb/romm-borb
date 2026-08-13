@@ -122,6 +122,55 @@ def safe_int_or_none(value: Any) -> int | None:
     return safe_int(value)
 
 
+# Fields that exist on every ROM row and that no list view renders. Measured on
+# a real 36k-entry library, one row is 5,479 bytes and 2,227 of those are
+# `igdb_metadata` alone - 1,531 of which is `similar_games`, a list of other
+# games with their cover URLs, attached to every row of a gallery the user is
+# scrolling past. The fields a list actually reads come to about 586 bytes.
+#
+# Emptied rather than removed, so the response keeps its shape and no client
+# has to cope with a missing key. The saving is the values, not the keys.
+LEAN_BLANKED_FIELDS: dict[str, Any] = {
+    "igdb_metadata": None,
+    "moby_metadata": None,
+    "ss_metadata": None,
+    "launchbox_metadata": None,
+    "hasheous_metadata": None,
+    "flashpoint_metadata": None,
+    "hltb_metadata": None,
+    "gamelist_metadata": None,
+    "manual_metadata": None,
+    "summary": None,
+    "alternative_names": [],
+    "merged_screenshots": [],
+    "sibling_roms": [],
+    "user_screenshots": [],
+    "user_saves": [],
+    "user_states": [],
+    "user_notes": [],
+    # Per-user state. A gallery row shows none of it, and the two flags a client
+    # might want - favourite, now-playing - are reachable as filters instead.
+    "rom_user": None,
+    # The large cover. A list renders the small one; a detail view re-fetches
+    # the single-ROM endpoint anyway, which carries both.
+    "path_cover_large": None,
+}
+
+
+def apply_lean(rom: SimpleRomSchema) -> SimpleRomSchema:
+    """Blank the fields a list view never reads. See LEAN_BLANKED_FIELDS."""
+    for field, empty in LEAN_BLANKED_FIELDS.items():
+        if hasattr(rom, field):
+            try:
+                setattr(rom, field, empty)
+            except (ValueError, AttributeError):
+                # A field that refuses the empty value keeps its real one.
+                # Costing bytes is the acceptable failure here; raising on a
+                # list request is not.
+                pass
+    return rom
+
+
 def build_sidecar_cache_key(
     user_id: int,
     order_by: str,
@@ -333,6 +382,17 @@ class CustomLimitOffsetPage[T: BaseModel](LimitOffsetPage[T]):
 @protected_route(router.get, "", [Scope.ROMS_READ])
 def get_roms(
     request: Request,
+    lean: Annotated[
+        bool,
+        Query(
+            description=(
+                "Omit the bulky per-ROM fields a list view never renders:"
+                " provider metadata blobs, summary, screenshots, per-user state"
+                " and siblings. The response keeps every key, so the shape is"
+                " unchanged - the values are just emptied."
+            )
+        ),
+    ] = False,
     with_char_index: Annotated[
         bool,
         Query(description="Whether to get the char index."),
@@ -823,7 +883,7 @@ def get_roms(
                         item, latest_saves.get(item.id)
                     )
 
-            return [
+            rows = [
                 SimpleRomSchema.from_orm_with_request(
                     db_rom=item,
                     request=request,
@@ -833,6 +893,7 @@ def get_roms(
                 )
                 for item in items
             ]
+            return [apply_lean(r) for r in rows] if lean else rows
 
         params = resolve_params()
         if with_rom_id_index:
