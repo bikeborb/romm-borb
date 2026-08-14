@@ -536,7 +536,22 @@ class DBRomsHandler(DBBaseHandler):
                     Rom.name,
                     Rom.fs_name_no_tags,
                     Rom.fs_name_no_ext,
-                )
+                ),
+                # load_only() restricts COLUMNS. It does nothing about
+                # relationships, and Rom.platform is lazy="joined", so without
+                # these every sibling row drags in Platform - which carries two
+                # non-deferred column_property aggregates that count and sum
+                # every ROM on the platform.
+                #
+                # On a 36k library that is two full-table aggregates per sibling
+                # row returned. Measured before this line existed: this single
+                # query took 3,647ms of a 4,654ms request and read 12.2 million
+                # tuples to return a 200-row page.
+                #
+                # filter_roms() already guards its sibling selectinload the same
+                # way. This batched path was added later and did not inherit it.
+                noload(Rom.platform),
+                noload(Rom.metadatum),
             )
         )
         if hidden_platform_ids:
